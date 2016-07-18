@@ -1,3 +1,4 @@
+import django
 from django.core.exceptions import ImproperlyConfigured
 from django.core.urlresolvers import NoReverseMatch
 from django.db.models import Model
@@ -11,13 +12,14 @@ from rest_framework.serializers import Serializer
 
 from rest_framework_json_api.exceptions import Conflict
 from rest_framework_json_api.serializers import ResourceIdentifierObjectSerializer
-from rest_framework_json_api.utils import format_relation_name, get_resource_type_from_instance, OrderedDict, Hyperlink
+from rest_framework_json_api.utils import get_resource_type_from_instance, OrderedDict, Hyperlink
 
 
 class RelationshipView(generics.GenericAPIView):
     serializer_class = ResourceIdentifierObjectSerializer
     self_link_view_name = None
     related_link_view_name = None
+    field_name_mapping = {}
 
     def get_serializer_class(self):
         if getattr(self, 'action', False) is None:
@@ -85,13 +87,19 @@ class RelationshipView(generics.GenericAPIView):
             serializer = self.get_serializer(data=request.data, model_class=related_model_class, many=True)
             serializer.is_valid(raise_exception=True)
             related_instance_or_manager.all().delete()
-            related_instance_or_manager.add(*serializer.validated_data)
+            # have to set bulk to False since data isn't saved yet
+            if django.VERSION >= (1, 9):
+                related_instance_or_manager.add(*serializer.validated_data,
+                                                bulk=False)
+            else:
+                related_instance_or_manager.add(*serializer.validated_data)
         else:
             related_model_class = related_instance_or_manager.__class__
             serializer = self.get_serializer(data=request.data, model_class=related_model_class)
             serializer.is_valid(raise_exception=True)
-            setattr(parent_obj, kwargs['related_field'], serializer.validated_data)
+            setattr(parent_obj, self.get_related_field_name(), serializer.validated_data)
             parent_obj.save()
+            related_instance_or_manager = self.get_related_instance()  # Refresh instance
         result_serializer = self._instantiate_serializer(related_instance_or_manager)
         return Response(result_serializer.data)
 
@@ -132,9 +140,15 @@ class RelationshipView(generics.GenericAPIView):
 
     def get_related_instance(self):
         try:
-            return getattr(self.get_object(), self.kwargs['related_field'])
+            return getattr(self.get_object(), self.get_related_field_name())
         except AttributeError:
             raise NotFound
+
+    def get_related_field_name(self):
+        field_name = self.kwargs['related_field']
+        if field_name in self.field_name_mapping:
+            return self.field_name_mapping[field_name]
+        return field_name
 
     def _instantiate_serializer(self, instance):
         if isinstance(instance, Model) or instance is None:
@@ -147,8 +161,8 @@ class RelationshipView(generics.GenericAPIView):
 
     def get_resource_name(self):
         if not hasattr(self, '_resource_name'):
-            instance = getattr(self.get_object(), self.kwargs['related_field'])
-            self._resource_name = format_relation_name(get_resource_type_from_instance(instance))
+            instance = getattr(self.get_object(), self.get_related_field_name())
+            self._resource_name = get_resource_type_from_instance(instance)
         return self._resource_name
 
     def set_resource_name(self, value):

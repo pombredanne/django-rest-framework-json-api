@@ -42,12 +42,19 @@ class JSONAPIMetadata(SimpleMetadata):
         serializers.Serializer: 'Serializer',
     })
 
-    relation_type_lookup = ClassLookupDict({
-        related.ManyRelatedObjectsDescriptor: 'ManyToMany',
-        related.ReverseManyRelatedObjectsDescriptor: 'ManyToMany',
-        related.ForeignRelatedObjectsDescriptor: 'OneToMany',
-        related.ReverseSingleRelatedObjectDescriptor: 'ManyToOne',
-    })
+    try:
+        relation_type_lookup = ClassLookupDict({
+            related.ManyToManyDescriptor: 'ManyToMany',
+            related.ReverseManyToOneDescriptor: 'OneToMany',
+            related.ForwardManyToOneDescriptor: 'ManyToOne',
+        })
+    except AttributeError:
+        relation_type_lookup = ClassLookupDict({
+            related.ManyRelatedObjectsDescriptor: 'ManyToMany',
+            related.ReverseManyRelatedObjectsDescriptor: 'ManyToMany',
+            related.ForeignRelatedObjectsDescriptor: 'OneToMany',
+            related.ReverseSingleRelatedObjectDescriptor: 'ManyToOne',
+        })
 
     def determine_metadata(self, request, view):
         metadata = OrderedDict()
@@ -76,15 +83,16 @@ class JSONAPIMetadata(SimpleMetadata):
         serializer.fields.pop(api_settings.URL_FIELD_NAME, None)
 
         return OrderedDict(
-            [(field_name, self.get_field_info(field, serializer)) for field_name, field in serializer.fields.items()]
+            [(field_name, self.get_field_info(field)) for field_name, field in serializer.fields.items()]
         )
 
-    def get_field_info(self, field, serializer):
+    def get_field_info(self, field):
         """
         Given an instance of a serializer field, return a dictionary
         of metadata about it.
         """
         field_info = OrderedDict()
+        serializer = field.parent
 
         if isinstance(field, serializers.ManyRelatedField):
             field_info['type'] = self.type_lookup[field.child_relation]
@@ -115,8 +123,22 @@ class JSONAPIMetadata(SimpleMetadata):
                 field_info[attr] = force_text(value, strings_only=True)
 
         if getattr(field, 'child', None):
-            field_info['child'] = self.get_field_info(field.child, field.child.serializer)
+            field_info['child'] = self.get_field_info(field.child)
         elif getattr(field, 'fields', None):
             field_info['children'] = self.get_serializer_info(field)
+
+        if (not field_info.get('read_only')
+            and hasattr(field, 'choices')
+            and not field_info.get('relationship_resource')):
+            field_info['choices'] = [
+                {
+                    'value': choice_value,
+                    'display_name': force_text(choice_name, strings_only=True)
+                }
+                for choice_value, choice_name in field.choices.items()
+            ]
+
+        if hasattr(serializer, 'included_serializers') and 'relationship_resource' in field_info:
+            field_info['allows_include'] = field.field_name in serializer.included_serializers
 
         return field_info

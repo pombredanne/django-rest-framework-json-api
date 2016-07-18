@@ -3,6 +3,7 @@ import json
 from django.contrib.auth import get_user_model
 from django.utils import encoding
 from django.core.urlresolvers import reverse
+from django.conf import settings
 
 from example.tests import TestBase
 from example.tests.utils import dump_json, redump_json
@@ -21,6 +22,12 @@ class ModelViewSetTests(TestBase):
     def setUp(self):
         super(ModelViewSetTests, self).setUp()
         self.detail_url = reverse('user-detail', kwargs={'pk': self.miles.pk})
+
+        setattr(settings, 'JSON_API_FORMAT_KEYS', 'dasherize')
+
+    def tearDown(self):
+
+        setattr(settings, 'JSON_API_FORMAT_KEYS', 'camelize')
 
     def test_key_in_list_result(self):
         """
@@ -176,6 +183,25 @@ class ModelViewSetTests(TestBase):
         expected_dump = dump_json(expected)
 
         assert expected_dump == content_dump
+
+    def test_patch_requires_id(self):
+        """
+        Verify that 'id' is required to be passed in an update request.
+        """
+        data = {
+            'data': {
+                'type': 'users',
+                'attributes': {
+                    'first-name': 'DifferentName'
+                }
+            }
+        }
+
+        response = self.client.patch(self.detail_url,
+                                     content_type='application/vnd.api+json',
+                                     data=dump_json(data))
+
+        self.assertEqual(response.status_code, 400)
 
     def test_key_in_post(self):
         """

@@ -37,11 +37,9 @@ PASSWORD_HASHERS = ('django.contrib.auth.hashers.UnsaltedMD5PasswordHasher', )
 MIDDLEWARE_CLASSES = ()
 
 JSON_API_FORMAT_KEYS = 'camelize'
-JSON_API_FORMAT_RELATION_KEYS = 'camelize'
+JSON_API_FORMAT_TYPES = 'camelize'
 REST_FRAMEWORK = {
-    'PAGINATE_BY': 5,
-    'PAGINATE_BY_PARAM': 'page_size',
-    'MAX_PAGINATE_BY': 100,
+    'PAGE_SIZE': 5,
     'EXCEPTION_HANDLER': 'rest_framework_json_api.exceptions.exception_handler',
     'DEFAULT_PAGINATION_CLASS':
         'rest_framework_json_api.pagination.PageNumberPagination',

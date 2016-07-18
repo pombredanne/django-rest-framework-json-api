@@ -3,10 +3,12 @@ import json
 from rest_framework.fields import MISSING_ERROR_MESSAGE
 from rest_framework.relations import *
 from django.utils.translation import ugettext_lazy as _
+from django.db.models.query import QuerySet
 
 from rest_framework_json_api.exceptions import Conflict
-from rest_framework_json_api.utils import format_relation_name, Hyperlink, \
-    get_resource_type_from_queryset, get_resource_type_from_instance
+from rest_framework_json_api.utils import Hyperlink, \
+    get_resource_type_from_queryset, get_resource_type_from_instance, \
+    get_included_serializers, get_resource_type_from_serializer
 
 
 class ResourceRelatedField(PrimaryKeyRelatedField):
@@ -19,6 +21,8 @@ class ResourceRelatedField(PrimaryKeyRelatedField):
         'does_not_exist': _('Invalid pk "{pk_value}" - object does not exist.'),
         'incorrect_type': _('Incorrect type. Expected resource identifier object, received {data_type}.'),
         'incorrect_relation_type': _('Incorrect relation type. Expected {relation_type}, received {received_type}.'),
+        'missing_type': _('Invalid resource identifier object: missing \'type\' attribute'),
+        'missing_id': _('Invalid resource identifier object: missing \'id\' attribute'),
         'no_match': _('Invalid hyperlink - No URL match.'),
     }
 
@@ -30,6 +34,11 @@ class ResourceRelatedField(PrimaryKeyRelatedField):
 
         self.related_link_lookup_field = kwargs.pop('related_link_lookup_field', self.related_link_lookup_field)
         self.related_link_url_kwarg = kwargs.pop('related_link_url_kwarg', self.related_link_lookup_field)
+
+        # check for a model class that was passed in for the relation type
+        model = kwargs.pop('model', None)
+        if model:
+            self.model = model
 
         # We include this simply for dependency injection in tests.
         # We can't add it as a class attributes or it would expect an
@@ -104,12 +113,24 @@ class ResourceRelatedField(PrimaryKeyRelatedField):
 
     def to_internal_value(self, data):
         if isinstance(data, six.text_type):
-            data = json.loads(data)
+            try:
+                data = json.loads(data)
+            except ValueError:
+                # show a useful error if they send a `pk` instead of resource object
+                self.fail('incorrect_type', data_type=type(data).__name__)
         if not isinstance(data, dict):
             self.fail('incorrect_type', data_type=type(data).__name__)
         expected_relation_type = get_resource_type_from_queryset(self.queryset)
+
+        if 'type' not in data:
+            self.fail('missing_type')
+
+        if 'id' not in data:
+            self.fail('missing_id')
+
         if data['type'] != expected_relation_type:
             self.conflict('incorrect_relation_type', relation_type=expected_relation_type, received_type=data['type'])
+
         return super(ResourceRelatedField, self).to_internal_value(data['id'])
 
     def to_representation(self, value):
@@ -118,7 +139,18 @@ class ResourceRelatedField(PrimaryKeyRelatedField):
         else:
             pk = value.pk
 
-        return OrderedDict([('type', format_relation_name(get_resource_type_from_instance(value))), ('id', str(pk))])
+        # check to see if this resource has a different resource_name when
+        # included and use that name
+        resource_type = None
+        root = getattr(self.parent, 'parent', self.parent)
+        field_name = self.field_name if self.field_name else self.parent.field_name
+        if getattr(root, 'included_serializers', None) is not None:
+            includes = get_included_serializers(root)
+            if field_name in includes.keys():
+                resource_type = get_resource_type_from_serializer(includes[field_name])
+
+        resource_type = resource_type if resource_type else get_resource_type_from_instance(value)
+        return OrderedDict([('type', resource_type), ('id', str(pk))])
 
     @property
     def choices(self):
@@ -136,3 +168,51 @@ class ResourceRelatedField(PrimaryKeyRelatedField):
             for item in queryset
         ])
 
+
+
+class SerializerMethodResourceRelatedField(ResourceRelatedField):
+    """
+    Allows us to use serializer method RelatedFields
+    with return querysets
+    """
+    def __new__(cls, *args, **kwargs):
+        """
+        We override this because getting serializer methods
+        fails at the base class when many=True
+        """
+        if kwargs.pop('many', False):
+            return cls.many_init(*args, **kwargs)
+        return super(ResourceRelatedField, cls).__new__(cls, *args, **kwargs)
+
+    def __init__(self, child_relation=None, *args, **kwargs):
+        # DRF 3.1 doesn't expect the `many` kwarg
+        kwargs.pop('many', None)
+        model = kwargs.pop('model', None)
+        if model:
+            self.model = model
+        super(SerializerMethodResourceRelatedField, self).__init__(child_relation, *args, **kwargs)
+
+    @classmethod
+    def many_init(cls, *args, **kwargs):
+        list_kwargs = {'child_relation': cls(*args, **kwargs)}
+        for key in kwargs.keys():
+            if key in ('model',) + MANY_RELATION_KWARGS:
+                list_kwargs[key] = kwargs[key]
+        return SerializerMethodResourceRelatedField(**list_kwargs)
+
+    def get_attribute(self, instance):
+        # check for a source fn defined on the serializer instead of the model
+        if self.source and hasattr(self.parent, self.source):
+            serializer_method = getattr(self.parent, self.source)
+            if hasattr(serializer_method, '__call__'):
+                return serializer_method(instance)
+        return super(SerializerMethodResourceRelatedField, self).get_attribute(instance)
+
+    def to_representation(self, value):
+        if isinstance(value, QuerySet):
+            base = super(SerializerMethodResourceRelatedField, self)
+            return [base.to_representation(x) for x in value]
+        return super(SerializerMethodResourceRelatedField, self).to_representation(value)
+
+    def get_links(self, obj=None, lookup_field='pk'):
+        return OrderedDict()

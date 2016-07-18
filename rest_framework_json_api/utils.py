@@ -1,21 +1,19 @@
 """
 Utils.
 """
+import copy
+import warnings
+from collections import OrderedDict
+import inspect
+
 import inflection
 from django.conf import settings
-from django.utils import six, encoding
+from django.utils import encoding
+from django.utils import six
+from django.utils.module_loading import import_string as import_class_from_dotted_path
 from django.utils.translation import ugettext_lazy as _
-from rest_framework.serializers import BaseSerializer, ListSerializer, ModelSerializer
-from rest_framework.relations import RelatedField, HyperlinkedRelatedField, PrimaryKeyRelatedField, \
-    HyperlinkedIdentityField
-from rest_framework.settings import api_settings
 from rest_framework.exceptions import APIException
-
-
-try:
-    from rest_framework.compat import OrderedDict
-except ImportError:
-    OrderedDict = dict
+from rest_framework import exceptions
 
 try:
     from rest_framework.serializers import ManyRelatedField
@@ -52,11 +50,11 @@ def get_resource_name(context):
         resource_name = getattr(view, 'resource_name')
     except AttributeError:
         try:
-            serializer = getattr(view, 'serializer_class')
+            serializer = view.get_serializer_class()
             return get_resource_type_from_serializer(serializer)
         except AttributeError:
             try:
-                resource_name = view.model.__name__
+                resource_name = get_resource_type_from_model(view.model)
             except AttributeError:
                 resource_name = view.__class__.__name__
 
@@ -65,17 +63,28 @@ def get_resource_name(context):
                 return resource_name
 
             # the name was calculated automatically from the view > pluralize and format
-            resource_name = format_relation_name(resource_name)
+            resource_name = format_resource_type(resource_name)
 
     return resource_name
 
 
 def get_serializer_fields(serializer):
+    fields = None
     if hasattr(serializer, 'child'):
-        return getattr(serializer.child, 'fields')
+        fields = getattr(serializer.child, 'fields')
+        meta = getattr(serializer.child, 'Meta', None)
     if hasattr(serializer, 'fields'):
-        return getattr(serializer, 'fields')
+        fields = getattr(serializer, 'fields')
+        meta = getattr(serializer, 'Meta', None)
 
+    if fields is not None:
+        meta_fields = getattr(meta, 'meta_fields', {})
+        for field in meta_fields:
+            try:
+                fields.pop(field)
+            except KeyError:
+                pass
+        return fields
 
 def format_keys(obj, format_type=None):
     """
@@ -132,10 +141,18 @@ def format_value(value, format_type=None):
 
 
 def format_relation_name(value, format_type=None):
+    warnings.warn("The 'format_relation_name' function has been renamed 'format_resource_type' and the settings are now 'JSON_API_FORMAT_TYPES' and 'JSON_API_PLURALIZE_TYPES'")
     if format_type is None:
-        format_type = getattr(settings, 'JSON_API_FORMAT_RELATION_KEYS', False)
+        format_type = getattr(settings, 'JSON_API_FORMAT_RELATION_KEYS', None)
+    pluralize = getattr(settings, 'JSON_API_PLURALIZE_RELATION_TYPE', None)
+    return format_resource_type(value, format_type, pluralize)
 
-    pluralize = getattr(settings, 'JSON_API_PLURALIZE_RELATION_TYPE', False)
+def format_resource_type(value, format_type=None, pluralize=None):
+    if format_type is None:
+        format_type = getattr(settings, 'JSON_API_FORMAT_TYPES', False)
+
+    if pluralize is None:
+        pluralize = getattr(settings, 'JSON_API_PLURALIZE_TYPES', False)
 
     if format_type:
         # format_type will never be None here so we can use format_value
@@ -144,25 +161,12 @@ def format_relation_name(value, format_type=None):
     return inflection.pluralize(value) if pluralize else value
 
 
-def build_json_resource_obj(fields, resource, resource_instance, resource_name):
-    resource_data = [
-        ('type', resource_name),
-        ('id', encoding.force_text(resource_instance.pk) if resource_instance else None),
-        ('attributes', extract_attributes(fields, resource)),
-    ]
-    relationships = extract_relationships(fields, resource, resource_instance)
-    if relationships:
-        resource_data.append(('relationships', relationships))
-    # Add 'self' link if field is present and valid
-    if api_settings.URL_FIELD_NAME in resource and \
-            isinstance(fields[api_settings.URL_FIELD_NAME], RelatedField):
-        resource_data.append(('links', {'self': resource[api_settings.URL_FIELD_NAME]}))
-    return OrderedDict(resource_data)
-
-
 def get_related_resource_type(relation):
     if hasattr(relation, '_meta'):
         relation_model = relation._meta.model
+    elif hasattr(relation, 'model'):
+        # the model type was explicitly passed as a kwarg to ResourceRelatedField
+        relation_model = relation.model
     elif hasattr(relation, 'get_queryset') and relation.get_queryset() is not None:
         relation_model = relation.get_queryset().model
     else:
@@ -181,16 +185,22 @@ def get_related_resource_type(relation):
             parent_model_relation = getattr(parent_model, parent_serializer.field_name)
 
         if hasattr(parent_model_relation, 'related'):
-            relation_model = parent_model_relation.related.related_model
+            try:
+                relation_model = parent_model_relation.related.related_model
+            except AttributeError:
+                # Django 1.7
+                relation_model = parent_model_relation.related.model
         elif hasattr(parent_model_relation, 'field'):
-            relation_model = parent_model_relation.field.related.model
+            try:
+                relation_model = parent_model_relation.field.remote_field.model
+            except AttributeError:
+                relation_model = parent_model_relation.field.related.model
         else:
-            raise APIException('Unable to find related model for relation {relation}'.format(relation=relation))
-    return format_relation_name(relation_model.__name__)
+            return get_related_resource_type(parent_model_relation)
+    return get_resource_type_from_model(relation_model)
 
 
 def get_instance_or_manager_resource_type(resource_instance_or_manager):
-
     if hasattr(resource_instance_or_manager, 'model'):
         return get_resource_type_from_manager(resource_instance_or_manager)
     if hasattr(resource_instance_or_manager, '_meta'):
@@ -198,248 +208,51 @@ def get_instance_or_manager_resource_type(resource_instance_or_manager):
     pass
 
 
+def get_resource_type_from_model(model):
+    json_api_meta = getattr(model, 'JSONAPIMeta', None)
+    return getattr(
+        json_api_meta,
+        'resource_name',
+        format_resource_type(model.__name__))
+
+
 def get_resource_type_from_queryset(qs):
-    return format_relation_name(qs.model._meta.model.__name__)
+    return get_resource_type_from_model(qs.model)
 
 
 def get_resource_type_from_instance(instance):
-    return format_relation_name(instance._meta.model.__name__)
+    return get_resource_type_from_model(instance._meta.model)
 
 
 def get_resource_type_from_manager(manager):
-    return format_relation_name(manager.model.__name__)
+    return get_resource_type_from_model(manager.model)
 
 
 def get_resource_type_from_serializer(serializer):
-    try:
-        # Check the meta class for resource_name
+    if hasattr(serializer.Meta, 'resource_name'):
         return serializer.Meta.resource_name
+    else:
+        return get_resource_type_from_model(serializer.Meta.model)
+
+
+def get_default_included_resources_from_serializer(serializer):
+    try:
+        return list(serializer.JSONAPIMeta.included_resources)
     except AttributeError:
-        # Use the serializer model then pluralize and format
-        return format_relation_name(serializer.Meta.model.__name__)
+        return []
 
 
-def extract_attributes(fields, resource):
-    data = OrderedDict()
-    for field_name, field in six.iteritems(fields):
-        # ID is always provided in the root of JSON API so remove it from attributes
-        if field_name == 'id':
-            continue
-        # Skip fields with relations
-        if isinstance(field, (RelatedField, BaseSerializer, ManyRelatedField)):
-            continue
+def get_included_serializers(serializer):
+    included_serializers = copy.copy(getattr(serializer, 'included_serializers', dict()))
 
-        # Skip read_only attribute fields when the resource is non-existent
-        # Needed for the "Raw data" form of the browseable API
-        if resource.get(field_name) is None and fields[field_name].read_only:
-            continue
+    for name, value in six.iteritems(included_serializers):
+        if not isinstance(value, type):
+            if value == 'self':
+                included_serializers[name] = serializer if isinstance(serializer, type) else serializer.__class__
+            else:
+                included_serializers[name] = import_class_from_dotted_path(value)
 
-        data.update({
-            field_name: resource.get(field_name)
-        })
-
-    return format_keys(data)
-
-
-def extract_relationships(fields, resource, resource_instance):
-    # Avoid circular deps
-    from rest_framework_json_api.relations import ResourceRelatedField
-
-    data = OrderedDict()
-
-    # Don't try to extract relationships from a non-existent resource
-    if resource_instance is None:
-        return
-
-    for field_name, field in six.iteritems(fields):
-        # Skip URL field
-        if field_name == api_settings.URL_FIELD_NAME:
-            continue
-
-        # Skip fields without relations
-        if not isinstance(field, (RelatedField, ManyRelatedField, BaseSerializer)):
-            continue
-
-        try:
-            source = field.source
-            relation_instance_or_manager = getattr(resource_instance, source)
-        except AttributeError:  # Skip fields defined on the serializer that don't correspond to a field on the model
-            continue
-
-        relation_type = get_related_resource_type(field)
-
-        if isinstance(field, HyperlinkedIdentityField):
-            # special case for HyperlinkedIdentityField
-            relation_data = list()
-
-            # Don't try to query an empty relation
-            relation_queryset = relation_instance_or_manager.all() \
-                if relation_instance_or_manager is not None else list()
-
-            for related_object in relation_queryset:
-                relation_data.append(
-                    OrderedDict([('type', relation_type), ('id', encoding.force_text(related_object.pk))])
-                )
-
-            data.update({field_name: {
-                'links': {
-                    "related": resource.get(field_name)},
-                'data': relation_data,
-                'meta': {
-                    'count': len(relation_data)
-                }
-            }})
-            continue
-
-        if isinstance(field, ResourceRelatedField):
-            # special case for ResourceRelatedField
-            relation_data = {
-                'data': resource.get(field_name)
-            }
-
-            field_links = field.get_links(resource_instance)
-            relation_data.update(
-                {'links': field_links}
-                if field_links else dict()
-            )
-            data.update({field_name: relation_data})
-            continue
-
-        if isinstance(field, (PrimaryKeyRelatedField, HyperlinkedRelatedField)):
-            relation_id = relation_instance_or_manager.pk if resource.get(field_name) else None
-
-            relation_data = {
-                'data': (
-                    OrderedDict([('type', relation_type), ('id', encoding.force_text(relation_id))])
-                    if relation_id is not None else None)
-            }
-
-            relation_data.update(
-                {'links': {'related': resource.get(field_name)}}
-                if isinstance(field, HyperlinkedRelatedField) and resource.get(field_name) else dict()
-            )
-            data.update({field_name: relation_data})
-            continue
-
-        if isinstance(field, ManyRelatedField):
-
-            if isinstance(field.child_relation, ResourceRelatedField):
-                # special case for ResourceRelatedField
-                relation_data = {
-                    'data': resource.get(field_name)
-                }
-
-                field_links = field.child_relation.get_links(resource_instance)
-                relation_data.update(
-                    {'links': field_links}
-                    if field_links else dict()
-                )
-                relation_data.update(
-                    {
-                        'meta': {
-                            'count': len(resource.get(field_name))
-                        }
-                    }
-                )
-                data.update({field_name: relation_data})
-                continue
-
-            relation_data = list()
-            for related_object in relation_instance_or_manager.all():
-                related_object_type = get_instance_or_manager_resource_type(relation_instance_or_manager)
-                relation_data.append(OrderedDict([
-                    ('type', related_object_type),
-                    ('id', encoding.force_text(related_object.pk))
-                ]))
-            data.update({
-                field_name: {
-                    'data': relation_data,
-                    'meta': {
-                        'count': len(relation_data)
-                    }
-                }
-            })
-            continue
-
-        if isinstance(field, ListSerializer):
-            relation_data = list()
-
-            serializer_data = resource.get(field_name)
-            resource_instance_queryset = relation_instance_or_manager.all()
-            if isinstance(serializer_data, list):
-                for position in range(len(serializer_data)):
-                    nested_resource_instance = resource_instance_queryset[position]
-                    nested_resource_instance_type = get_resource_type_from_instance(nested_resource_instance)
-                    relation_data.append(OrderedDict([
-                        ('type', nested_resource_instance_type),
-                        ('id', encoding.force_text(nested_resource_instance.pk))
-                    ]))
-
-                data.update({field_name: {'data': relation_data}})
-                continue
-
-        if isinstance(field, ModelSerializer):
-            relation_model = field.Meta.model
-            relation_type = format_relation_name(relation_model.__name__)
-
-            data.update({
-                field_name: {
-                    'data': (
-                        OrderedDict([
-                            ('type', relation_type),
-                            ('id', encoding.force_text(relation_instance_or_manager.pk))
-                        ]) if resource.get(field_name) else None)
-                }
-            })
-            continue
-
-    return format_keys(data)
-
-
-def extract_included(fields, resource, resource_instance):
-    included_data = list()
-    for field_name, field in six.iteritems(fields):
-        # Skip URL field
-        if field_name == api_settings.URL_FIELD_NAME:
-            continue
-
-        # Skip fields without serialized data
-        if not isinstance(field, BaseSerializer):
-            continue
-
-        relation_instance_or_manager = getattr(resource_instance, field_name)
-        serializer_data = resource.get(field_name)
-
-        if isinstance(field, ListSerializer):
-            serializer = field.child
-            model = serializer.Meta.model
-            relation_type = format_relation_name(model.__name__)
-            relation_queryset = relation_instance_or_manager.all()
-
-            # Get the serializer fields
-            serializer_fields = get_serializer_fields(serializer)
-            if serializer_data:
-                for position in range(len(serializer_data)):
-                    serializer_resource = serializer_data[position]
-                    nested_resource_instance = relation_queryset[position]
-                    included_data.append(
-                        build_json_resource_obj(
-                            serializer_fields, serializer_resource, nested_resource_instance, relation_type
-                        )
-                    )
-
-        if isinstance(field, ModelSerializer):
-            model = field.Meta.model
-            relation_type = format_relation_name(model.__name__)
-
-            # Get the serializer fields
-            serializer_fields = get_serializer_fields(field)
-            if serializer_data:
-                included_data.append(
-                    build_json_resource_obj(serializer_fields, serializer_data, relation_instance_or_manager, relation_type)
-                )
-
-    return format_keys(included_data)
+    return included_serializers
 
 
 class Hyperlink(six.text_type):
@@ -458,3 +271,65 @@ class Hyperlink(six.text_type):
         return ret
 
     is_hyperlink = True
+
+
+def format_drf_errors(response, context, exc):
+    errors = []
+    # handle generic errors. ValidationError('test') in a view for example
+    if isinstance(response.data, list):
+        for message in response.data:
+            errors.append({
+                'detail': message,
+                'source': {
+                    'pointer': '/data',
+                },
+                'status': encoding.force_text(response.status_code),
+            })
+    # handle all errors thrown from serializers
+    else:
+        for field, error in response.data.items():
+            field = format_value(field)
+            pointer = '/data/attributes/{}'.format(field)
+            # see if they passed a dictionary to ValidationError manually
+            if isinstance(error, dict):
+                errors.append(error)
+            elif isinstance(error, six.string_types):
+                classes = inspect.getmembers(exceptions, inspect.isclass)
+                # DRF sets the `field` to 'detail' for its own exceptions
+                if isinstance(exc, tuple(x[1] for x in classes)):
+                    pointer = '/data'
+                errors.append({
+                    'detail': error,
+                    'source': {
+                        'pointer': pointer,
+                    },
+                    'status': encoding.force_text(response.status_code),
+                })
+            elif isinstance(error, list):
+                for message in error:
+                    errors.append({
+                        'detail': message,
+                        'source': {
+                            'pointer': pointer,
+                        },
+                        'status': encoding.force_text(response.status_code),
+                    })
+            else:
+                errors.append({
+                    'detail': error,
+                    'source': {
+                        'pointer': pointer,
+                    },
+                    'status': encoding.force_text(response.status_code),
+                })
+
+    context['view'].resource_name = 'errors'
+    response.data = errors
+
+    return response
+
+
+def format_errors(data):
+    if len(data) > 1 and isinstance(data, list):
+        data.sort(key=lambda x: x.get('source', {}).get('pointer', ''))
+    return {'errors': data}
